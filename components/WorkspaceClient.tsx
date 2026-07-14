@@ -193,33 +193,34 @@ export function WorkspaceClient({
 
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
+            let event: any;
             try {
-              const event = JSON.parse(line.slice(6));
-              if (event.type === "status") {
-                pushStep(event.message);
-              } else if (event.type === "done") {
-                completeSteps();
-                setWorkspaceId(event.workspaceId);
-                setFileData(event.fileData);
-                setCredits(event.creditsRemaining);
-                // Header shows credits from a Server Component fetch — nudge
-                // it to re-fetch now instead of staying stale until the next
-                // navigation/reload. Client state above is untouched by this.
-                router.refresh();
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "assistant", content: event.assistantMessage },
-                ]);
-                window.history.replaceState(
-                  null,
-                  "",
-                  `/workspace?id=${event.workspaceId}`,
-                );
-              } else if (event.type === "error") {
-                throw new Error(event.message);
-              }
+              event = JSON.parse(line.slice(6));
             } catch {
-              // skip malformed SSE lines
+              continue; // skip malformed SSE lines
+            }
+            if (event.type === "status") {
+              pushStep(event.message);
+            } else if (event.type === "done") {
+              completeSteps();
+              setWorkspaceId(event.workspaceId);
+              setFileData(event.fileData);
+              setCredits(event.creditsRemaining);
+              // Header shows credits from a Server Component fetch — nudge
+              // it to re-fetch now instead of staying stale until the next
+              // navigation/reload. Client state above is untouched by this.
+              router.refresh();
+              setMessages((prev) => [
+                ...prev,
+                { role: "assistant", content: event.assistantMessage },
+              ]);
+              window.history.replaceState(
+                null,
+                "",
+                `/workspace?id=${event.workspaceId}`,
+              );
+            } else if (event.type === "error") {
+              throw new Error(event.message);
             }
           }
         }
