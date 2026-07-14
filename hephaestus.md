@@ -28,8 +28,7 @@ bottom.
 
 Hephaestus is a **text-to-app builder**: you type "build me a kanban board,"
 and it generates a working React app, live, in your browser — you can see it
-running immediately, chat to change it, and download the code. Think of it as
-a scaled-down version of tools like v0.dev or bolt.new.
+running immediately, chat to change it, and download the code.
 
 The magic trick underneath is simpler than it looks: an AI model (Google
 Gemini) is really good at writing React code if you ask it the right way and
