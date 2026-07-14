@@ -58,6 +58,19 @@ function trimHistory(messages: Message[]): Message[] {
   return [messages[0], ...messages.slice(-8)];
 }
 
+// ─── 503 detection ─────────────────────────────────────────────────────────
+// Gemini returns this when the model is temporarily overloaded — worth a
+// retry rather than failing the whole generation outright.
+
+function isOverloadedError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "status" in err &&
+    (err as { status: unknown }).status === 503
+  );
+}
+
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are an expert React developer. Your job is to generate complete, working React applications based on user prompts.
@@ -199,46 +212,68 @@ export async function POST(request: NextRequest) {
       try {
         const contents = buildContents(messages, fileData);
 
-        // GEMINI_API_KEY (env var, read at module load in `ai` above) authenticates
-        // this call. generateContentStream (not generateContent) is what lets
-        // us forward Gemini's own "thinking" output as status updates below —
-        // a blocking call would only give us the final answer, all at once.
-        const geminiStream = await ai.models.generateContentStream({
-          model: "gemini-3.5-flash",
-          contents,
-          config: {
-            systemInstruction: SYSTEM_PROMPT,
-            temperature: 0.7,
-            responseMimeType: "application/json",
-            thinkingConfig: {
-              includeThoughts: true,
-            },
-          },
-        });
+        // Gemini 503s ("model overloaded") are common and transient — retry
+        // a couple of times with a short backoff before surfacing an error,
+        // instead of forcing the user to notice a toast and refresh the page.
+        const MAX_ATTEMPTS = 3;
+        const RETRY_DELAY_MS = 2000;
 
         let accumulated = ""; // final JSON output
-        let lastEmitTime = 0; // throttle thought emissions
 
-        for await (const chunk of geminiStream) {
-          const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+          accumulated = "";
+          let lastEmitTime = 0; // throttle thought emissions
 
-          for (const part of parts) {
-            if (!part.text) continue;
+          try {
+            // GEMINI_API_KEY (env var, read at module load in `ai` above)
+            // authenticates this call. generateContentStream (not
+            // generateContent) is what lets us forward Gemini's own
+            // "thinking" output as status updates below — a blocking call
+            // would only give us the final answer, all at once.
+            const geminiStream = await ai.models.generateContentStream({
+              model: "gemini-3.5-flash",
+              contents,
+              config: {
+                systemInstruction: SYSTEM_PROMPT,
+                temperature: 0.7,
+                responseMimeType: "application/json",
+                thinkingConfig: {
+                  includeThoughts: true,
+                },
+              },
+            });
 
-            if (part.thought) {
-              // Extract just the short label — not the full wall of text
-              const now = Date.now();
-              if (now - lastEmitTime > 600) {
-                const label = extractThoughtLabel(part.text);
-                if (label) {
-                  enqueue(sseEvent("status", { message: label }));
-                  lastEmitTime = now;
+            for await (const chunk of geminiStream) {
+              const parts = chunk.candidates?.[0]?.content?.parts ?? [];
+
+              for (const part of parts) {
+                if (!part.text) continue;
+
+                if (part.thought) {
+                  // Extract just the short label — not the full wall of text
+                  const now = Date.now();
+                  if (now - lastEmitTime > 600) {
+                    const label = extractThoughtLabel(part.text);
+                    if (label) {
+                      enqueue(sseEvent("status", { message: label }));
+                      lastEmitTime = now;
+                    }
+                  }
+                } else {
+                  // Actual JSON output
+                  accumulated += part.text;
                 }
               }
-            } else {
-              // Actual JSON output
-              accumulated += part.text;
             }
+
+            break; // success — stop retrying
+          } catch (err) {
+            if (isOverloadedError(err) && attempt < MAX_ATTEMPTS) {
+              enqueue(sseEvent("status", { message: "Gemini is busy, retrying…" }));
+              await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+              continue;
+            }
+            throw err; // out of retries, or a non-503 error — bubbles to outer catch
           }
         }
 
@@ -347,18 +382,12 @@ export async function POST(request: NextRequest) {
         );
       } catch (err) {
         console.error("[gen-ai-code] stream error:", err);
-        // Gemini itself being overloaded (503/UNAVAILABLE) is common and
-        // transient — tell the user that specifically instead of a generic
-        // "something went wrong," so retrying feels like the obvious next
-        // step rather than a shot in the dark.
-        const isOverloaded =
-          typeof err === "object" &&
-          err !== null &&
-          "status" in err &&
-          err.status === 503;
+        // Gemini overload (503/UNAVAILABLE) already got retried above; if we're
+        // here it's still failing, so tell the user that specifically instead
+        // of a generic "something went wrong."
         enqueue(
           sseEvent("error", {
-            message: isOverloaded
+            message: isOverloadedError(err)
               ? "Gemini is currently overloaded. Please wait a moment and try again."
               : "Something went wrong. Please try again.",
           }),
